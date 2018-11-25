@@ -7,6 +7,7 @@ from PIL import Image
 import cv2
 import re
 import unicodedata
+from collections import OrderedDict
 
 import keras
 from keras import backend as K
@@ -49,6 +50,29 @@ def get_random_eraser(p=0.5,
     return eraser
 
 
+def image_gen(rotation_range=180,
+              width_shift_range=0.2,
+              height_shift_range=0.2,
+              shear_range=10,
+              zoom_range=0.3,
+              horizontal_flip=True,
+              vertical_flip=True,
+              channel_shift_range=5.,
+              brightness_range=[0.3, 1.0],
+              preprocessing_function=get_random_eraser(v_l=0, v_h=255)):
+    return ImageDataGenerator(
+        rotation_range=rotation_range,
+        width_shift_range=width_shift_range,
+        height_shift_range=height_shift_range,
+        shear_range=shear_range,
+        zoom_range=zoom_range,
+        horizontal_flip=horizontal_flip,
+        vertical_flip=vertical_flip,
+        channel_shift_range=channel_shift_range,
+        brightness_range=brightness_range,
+        preprocessing_function=preprocessing_function)
+
+
 # convert Japanese characters to unicode
 # delete a character randomly with del_rate
 def convert_text_to_unicode(x, del_rate=0.001):
@@ -71,37 +95,26 @@ def reshape_text(x, max_length=200, del_rate=0.001):
 class MultiModalIterator():
     def __init__(self,
                  data_df,
+                 target_column,
                  train=True,
-                 target_column="target",
                  model_type="multiclassifier",
                  batch_size=8,
                  shuffle=True,
-                 imggen=ImageDataGenerator(
-                     rotation_range=180,
-                     width_shift_range=0.2,
-                     height_shift_range=0.2,
-                     shear_range=10,
-                     zoom_range=0.3,
-                     horizontal_flip=True,
-                     vertical_flip=True,
-                     channel_shift_range=5.,
-                     brightness_range=[0.3, 1.0],
-                     preprocessing_function=get_random_eraser(v_l=0, v_h=255),
-                 ),
+                 imagegen=image_gen(),
                  audiogen=audio_generator.AudioGenerator(
                      melsp=True, augment=True),
                  **params):
 
         self.data_df = data_df
         self.train = train
-        self.target_column = target_column
+        self.target_column = self._validate_target_column(target_column)
         self.model_type = model_type
         self.targets = self._get_target()
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.sample_num = len(self.data_df)
 
-        self.imggen = imggen
+        self.imagegen = imagegen
         self.audiogen = audiogen
 
         self.txt_length = params[
@@ -122,6 +135,12 @@ class MultiModalIterator():
                 inputs, targets = self._data_generation(batch_ids)
 
                 yield inputs, targets
+
+    def _validate_target_column(self, target_column):
+        if target_column not in self.data_df.columns:
+            raise KeyError("{0} not in data_df".format(target_column))
+        else:
+            return target_column
 
     def _get_target(self):
         if self.model_type == "multiclassifier":
@@ -188,8 +207,8 @@ class MultiModalIterator():
         if self.train:
             # data augmentations
             for i in range(self.batch_size):
-                _x[i] = self.imggen.random_transform(_x[i])
-                _x[i] = self.imggen.standardize(_x[i])
+                _x[i] = self.imagegen.random_transform(_x[i])
+                _x[i] = self.imagegen.standardize(_x[i])
         _x /= 255
         return _x
 
@@ -197,17 +216,91 @@ class MultiModalIterator():
         inputs = []
         num_inputs = []
         for i, c in enumerate(self.data_df.columns):
-            if c.endswith("_num"):
+            if c.endswith("num"):
                 num_inputs.append(self.data_df[c].values[batch_ids])
-            elif c.endswith("_txt"):
+            elif c.endswith("txt") or c.endswith("txt_path"):
                 x = self._load_txt(self.data_df[c].values[batch_ids])
                 inputs.append(x)
-            elif c.endswith("_img"):
+            elif c.endswith("img") or c.endswith("img_path"):
                 x = self._load_img(self.data_df[c].values[batch_ids])
                 inputs.append(x)
-            elif c.endswith("_snd"):
+            elif c.endswith("snd") or c.endswith("snd_path"):
                 x = self._load_snd(self.data_df[c].values[batch_ids])
                 inputs.append(x)
+        if len(num_inputs) > 0:
+            inputs.append(np.array(num_inputs).T)
+
+        targets = self.targets[batch_ids]
+        return inputs, targets
+
+
+class MultiModalModelIterator(MultiModalIterator):
+    def __init__(self,
+                 multimodalmodel,
+                 data_df,
+                 target_column,
+                 train=True,
+                 batch_size=8,
+                 shuffle=True,
+                 imagegen=image_gen(),
+                 audiogen=audio_generator.AudioGenerator(
+                     melsp=True, augment=True),
+                 **params):
+        super().__init__(
+            data_df=data_df,
+            target_column=target_column,
+            train=train,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            imagegen=imagegen,
+            audiogen=audiogen,
+            **params)
+        self.multimodalmodel = multimodalmodel
+        self.target_column = self._get_target_column(target_column)
+        self.model_type = self.multimodalmodel.model_type
+        self.targets = self._get_target()
+
+    def _get_target_column(self, target_column):
+        _target_column = self._validate_target_column(target_column)
+        if _target_column != self.multimodalmodel.target_column:
+            raise ValueError(
+                "target_column {0} is different from multimodalmodel target_column {1}".
+                format(_target_column, self.multimodalmodel.target_column))
+        else:
+            return _target_column
+
+    def _data_generation(self, batch_ids):
+        inputs = []
+        num_inputs = []
+
+        def _format_branch(format, column):
+            if format == "num":
+                x = np.array(
+                    [[x] for x in self.data_df[column].values[batch_ids]])
+                inputs.append(x)
+            elif format == "txt" or format == "txt_path":
+                x = self._load_txt(self.data_df[column].values[batch_ids])
+                inputs.append(x)
+            elif format == "img" or format == "img_path":
+                x = self._load_img(self.data_df[column].values[batch_ids])
+                inputs.append(x)
+            elif format == "snd" or format == "snd_path":
+                x = self._load_snd(self.data_df[column].values[batch_ids])
+                inputs.append(x)
+
+        for k, v in self.multimodalmodel.inputs_dict.items():
+            if self.multimodalmodel.modal_layer_dict is not None:
+                if isinstance(v["column"], str):
+                    if v["column"] in self.multimodalmodel.modal_layer_dict.keys(
+                    ):
+                        _format_branch(v["format"], v["column"])
+                        continue
+            if isinstance(v["column"], list):
+                if v["format"] == "num":
+                    for c in v["column"]:
+                        num_inputs.append(self.data_df[c].values[batch_ids])
+            else:
+                _format_branch(v["format"], v["column"])
         if len(num_inputs) > 0:
             inputs.append(np.array(num_inputs).T)
 

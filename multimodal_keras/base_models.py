@@ -32,10 +32,10 @@ def text_character_level_cnn(inputs, output_size):
         _x = GlobalMaxPooling1D()(_x)
         convs.append(_x)
     x = Concatenate()(convs)
-    x = Dense(1024, activation="selu", kernel_initializer="lecun_normal")(x)
+    x = Dense(1024, activation="relu")(x)
     x = Dropout(0.1)(x)
     x = Dense(
-        output_size, activation="selu", kernel_initializer="lecun_normal")(x)
+        output_size, activation="relu")(x)
     return x
 
 
